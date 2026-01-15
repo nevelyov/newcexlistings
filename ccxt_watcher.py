@@ -19,9 +19,11 @@ STATE_PATH = "data/seen_ccxt.json"
 # Optional: skip ultra-common tickers on first run (reduces spam)
 DEFAULT_SKIP = {"USDT", "USDC", "BTC", "ETH", "BNB", "SOL"}
 
+
 def _as_dict(x) -> dict:
     """Some exchanges return weird shapes (list/str/None). Force dict."""
     return x if isinstance(x, dict) else {}
+
 
 def _safe_get_contract_from_currency(currency: dict) -> Optional[str]:
     """Rare case: exchange returns contract info in currencies metadata."""
@@ -45,6 +47,7 @@ def _safe_get_contract_from_currency(currency: dict) -> Optional[str]:
                     candidates.append(v)
 
     return pick_best_contract(candidates) if candidates else None
+
 
 def resolve_contract_and_refs(
     ticker: str,
@@ -104,6 +107,7 @@ def resolve_contract_and_refs(
 
     return None, coingecko_id, None
 
+
 def build_message(
     exchange_id: str,
     ticker: str,
@@ -126,12 +130,21 @@ def build_message(
         lines.append(f"DexScreener: {dex_url}")
     return "\n".join(lines)
 
+
 def run_ccxt_scan(
     shard_index: int = 0,
     shard_total: int = 4,
     max_exchanges_per_run: int = 35,
     skip_common_on_first_run: bool = True,
 ) -> None:
+    """
+    HARD TIME LIMIT:
+    Each shard exits after MAX_SECONDS so GitHub job won't spin forever.
+    """
+    # ---- Hard runtime budget per shard ----
+    start = time.time()
+    MAX_SECONDS = 8 * 60  # 8 minutes per shard; adjust if needed
+
     state = load_state(STATE_PATH)
     seen_map: Dict[str, str] = state["seen"]
 
@@ -142,10 +155,18 @@ def run_ccxt_scan(
     first_run = (len(seen_map) == 0)
 
     for eid in shard_ids:
+        # stop if time budget exceeded
+        if time.time() - start > MAX_SECONDS:
+            break
+
         try:
             ex_class = getattr(ccxt, eid)
-            ex = ex_class({"enableRateLimit": True, "timeout": 20000})
+            ex = ex_class({
+                "enableRateLimit": True,
+                "timeout": 20000,
+            })
 
+            # Some exchanges hang — try/catch and continue
             try:
                 ex.load_markets()
             except Exception:
@@ -156,6 +177,10 @@ def run_ccxt_scan(
                 continue
 
             for code, c in currencies.items():
+                # stop if time budget exceeded
+                if time.time() - start > MAX_SECONDS:
+                    break
+
                 ticker = (code or "").upper().strip()
                 if not ticker:
                     continue
@@ -168,7 +193,7 @@ def run_ccxt_scan(
                     continue
 
                 found_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-                seen_map[key] = found_at
+                seen_map[key] = found_at  # store timestamp immediately
 
                 contract, cg_id, dex_url = resolve_contract_and_refs(ticker, c)
 
@@ -176,7 +201,7 @@ def run_ccxt_scan(
                     build_message(eid, ticker, contract, cg_id, dex_url, found_at)
                 )
 
-                # IMPORTANT: slow down to avoid Telegram 429 (and API bans)
+                # IMPORTANT: prevent Telegram 429 bursts across 4 shards
                 time.sleep(2.0)
 
         except Exception:

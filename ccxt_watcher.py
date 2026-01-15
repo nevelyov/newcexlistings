@@ -81,4 +81,82 @@ def resolve_contract_and_refs(ticker: str, currency_obj: dict) -> Tuple[Optional
     except Exception:
         pass
 
-    # 4) DexScreener fallback (contract + pair U
+    # 4) DexScreener fallback (contract + pair URL)
+    try:
+        pair = dex_search(t)
+        addr = extract_contract_from_pair(pair)
+        url = extract_pair_url(pair)
+        if addr or url:
+            return addr, coingecko_id, url
+    except Exception:
+        pass
+
+    return None, coingecko_id, None
+
+def build_message(exchange_id: str, ticker: str, contract: Optional[str], cg_id: Optional[str], dex_url: Optional[str]) -> str:
+    lines = [
+        "🆕 NEW (CCXT DETECTED)",
+        f"Exchange: {exchange_id}",
+        f"Ticker: {ticker}",
+        f"Contract: {contract or 'n/a'}",
+    ]
+    if cg_id:
+        lines.append(f"CoinGecko ID: {cg_id}")
+    if dex_url:
+        lines.append(f"DexScreener: {dex_url}")
+    return "\n".join(lines)
+
+def run_ccxt_scan(
+    shard_index: int = 0,
+    shard_total: int = 4,
+    max_exchanges_per_run: int = 35,
+    skip_common_on_first_run: bool = True,
+) -> None:
+    seen = load_set(STATE_PATH)
+    new_seen = set(seen)
+
+    ids = ccxt.exchanges
+    shard_ids = [eid for i, eid in enumerate(ids) if (i % shard_total) == shard_index]
+    shard_ids = shard_ids[:max_exchanges_per_run]
+
+    first_run = (len(seen) == 0)
+
+    for eid in shard_ids:
+        try:
+            ex_class = getattr(ccxt, eid)
+            ex = ex_class({"enableRateLimit": True, "timeout": 20000})
+
+            try:
+                ex.load_markets()
+            except Exception:
+                pass
+
+            currencies: Dict[str, Any] = getattr(ex, "currencies", None) or {}
+            if not currencies:
+                continue
+
+            for code, c in currencies.items():
+                ticker = (code or "").upper().strip()
+                if not ticker:
+                    continue
+
+                if first_run and skip_common_on_first_run and ticker in DEFAULT_SKIP:
+                    continue
+
+                key = f"{eid}:{ticker}"
+                if key in seen:
+                    continue
+
+                contract, cg_id, dex_url = resolve_contract_and_refs(ticker, c)
+
+                send_telegram_message(build_message(eid, ticker, contract, cg_id, dex_url))
+
+                new_seen.add(key)
+                time.sleep(0.6)
+
+        except Exception:
+            traceback.print_exc()
+            continue
+
+    if new_seen != seen:
+        save_set(STATE_PATH, new_seen)

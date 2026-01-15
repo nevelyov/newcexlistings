@@ -2,6 +2,7 @@ import ccxt
 import time
 import traceback
 from typing import List, Dict, Optional
+from utils.coingecko import enrich
 
 from utils.state2 import load_set, save_set
 from utils.tg import send_telegram_message

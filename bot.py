@@ -141,4 +141,12 @@ def run():
         save_seen(new_seen)
 
 if __name__ == "__main__":
+    # shard config (from GitHub Actions matrix)
+    shard_index = int(os.getenv("SHARD_INDEX", "0"))
+    shard_total = int(os.getenv("SHARD_TOTAL", "4"))
+
+    # 1) CCXT scan (100+ exchanges, sharded)
+    run_ccxt_scan(shard_index=shard_index, shard_total=shard_total)
+
+    # 2) Your existing announcements scan (non-CCXT + extra signal)
     run()

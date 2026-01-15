@@ -5,7 +5,6 @@ on:
     - cron: "*/20 * * * *"
   workflow_dispatch:
 
-
 concurrency:
   group: cex-listing-watcher
   cancel-in-progress: true
@@ -20,6 +19,7 @@ jobs:
     strategy:
       matrix:
         shard: [0, 1, 2, 3]
+
     steps:
       - uses: actions/checkout@v4
 
@@ -36,10 +36,10 @@ jobs:
         env:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          TG_CHAT_IDS: ${{ secrets.TG_CHAT_IDS }}
           SHARD_INDEX: ${{ matrix.shard }}
           SHARD_TOTAL: "4"
-          # optional: avoid CoinGecko 429
-          DISABLE_COINGECKO: "1"
+          DISABLE_COINGECKO: "0"
         run: |
           python bot.py
 

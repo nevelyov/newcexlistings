@@ -3,7 +3,9 @@ import time
 import traceback
 from typing import Optional, Dict, Any, Tuple
 
-from utils.state2 import load_set, save_set
+from utils.state2 import load_state, save_state
+from datetime import datetime, timezone
+
 from utils.tg import send_telegram_message
 from utils.parse import pick_best_contract, extract_contracts
 from utils.coingecko import enrich, search_coin  # <-- we use search_coin to get CoinGecko ID

@@ -2,7 +2,7 @@ name: CEX Listing Watcher
 
 on:
   schedule:
-    - cron: "*/5 * * * *"
+    - cron: "*/10 * * * *"
   workflow_dispatch:
 
 permissions:
@@ -11,6 +11,9 @@ permissions:
 jobs:
   run-bot:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        shard: [0, 1, 2, 3]
     steps:
       - uses: actions/checkout@v4
 
@@ -27,6 +30,10 @@ jobs:
         env:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          SHARD_INDEX: ${{ matrix.shard }}
+          SHARD_TOTAL: "4"
+          # optional: avoid CoinGecko 429
+          DISABLE_COINGECKO: "1"
         run: |
           python bot.py
 
@@ -34,5 +41,5 @@ jobs:
         run: |
           git config user.name "cex-listing-bot"
           git config user.email "cex-listing-bot@users.noreply.github.com"
-          git add data/seen.json
+          git add data/seen.json data/seen_ccxt.json
           git diff --cached --quiet || (git commit -m "update seen listings" && git push)

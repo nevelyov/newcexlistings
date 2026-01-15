@@ -19,22 +19,26 @@ STATE_PATH = "data/seen_ccxt.json"
 # Optional: skip ultra-common tickers on first run (reduces spam)
 DEFAULT_SKIP = {"USDT", "USDC", "BTC", "ETH", "BNB", "SOL"}
 
+def _as_dict(x) -> dict:
+    """Some exchanges return weird shapes (list/str/None). Force dict."""
+    return x if isinstance(x, dict) else {}
+
 def _safe_get_contract_from_currency(currency: dict) -> Optional[str]:
     """Rare case: exchange returns contract info in currencies metadata."""
-    if not currency:
+    if not isinstance(currency, dict):
         return None
 
-    info = currency.get("info") or {}
+    info = _as_dict(currency.get("info"))
     for k in ["contractAddress", "contract_address", "tokenAddress", "address", "contract"]:
         v = info.get(k)
         if isinstance(v, str) and v:
             return v
 
-    networks = currency.get("networks") or {}
+    networks = currency.get("networks") if isinstance(currency.get("networks"), dict) else {}
     candidates = []
     for _, obj in networks.items():
         if isinstance(obj, dict):
-            inf = obj.get("info") or {}
+            inf = _as_dict(obj.get("info"))
             for k in ["contractAddress", "contract_address", "tokenAddress", "address", "contract"]:
                 v = inf.get(k)
                 if isinstance(v, str) and v:
@@ -58,13 +62,15 @@ def resolve_contract_and_refs(
     if not t:
         return None, None, None
 
+    currency_obj = currency_obj if isinstance(currency_obj, dict) else {}
+
     # 1) Exchange metadata
     contract = _safe_get_contract_from_currency(currency_obj)
     if contract:
         return contract, None, None
 
-    # 2) Raw info scan
-    raw = str((currency_obj or {}).get("info") or "")
+    # 2) Raw info scan (info may be list/str/etc)
+    raw = str(currency_obj.get("info") or "")
     cands = extract_contracts(raw)
     contract = pick_best_contract(cands)
     if contract:
@@ -126,7 +132,6 @@ def run_ccxt_scan(
     max_exchanges_per_run: int = 35,
     skip_common_on_first_run: bool = True,
 ) -> None:
-    # Load state dict: {"seen": { "EXCHANGE:TICKER": "timestamp", ... }}
     state = load_state(STATE_PATH)
     seen_map: Dict[str, str] = state["seen"]
 
@@ -137,7 +142,6 @@ def run_ccxt_scan(
     first_run = (len(seen_map) == 0)
 
     for eid in shard_ids:
-        eid_up = (eid or "").upper()
         try:
             ex_class = getattr(ccxt, eid)
             ex = ex_class({"enableRateLimit": True, "timeout": 20000})
@@ -148,7 +152,7 @@ def run_ccxt_scan(
                 pass
 
             currencies: Dict[str, Any] = getattr(ex, "currencies", None) or {}
-            if not currencies:
+            if not isinstance(currencies, dict) or not currencies:
                 continue
 
             for code, c in currencies.items():
@@ -159,24 +163,24 @@ def run_ccxt_scan(
                 if first_run and skip_common_on_first_run and ticker in DEFAULT_SKIP:
                     continue
 
-                key = f"{eid_up}:{ticker}"
+                key = f"{(eid or '').upper()}:{ticker}"
                 if key in seen_map:
                     continue
 
                 found_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-                seen_map[key] = found_at  # store timestamp immediately (prevents duplicate spam)
+                seen_map[key] = found_at
 
                 contract, cg_id, dex_url = resolve_contract_and_refs(ticker, c)
 
                 send_telegram_message(
-                    build_message(eid_up, ticker, contract, cg_id, dex_url, found_at)
+                    build_message(eid, ticker, contract, cg_id, dex_url, found_at)
                 )
 
-                time.sleep(0.6)
+                # IMPORTANT: slow down to avoid Telegram 429 (and API bans)
+                time.sleep(2.0)
 
         except Exception:
             traceback.print_exc()
             continue
 
-    # Save updated timestamps
     save_state(STATE_PATH, state)

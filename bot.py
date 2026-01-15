@@ -2,6 +2,8 @@ import time
 import hashlib
 import requests
 import yaml
+import os
+from ccxt_watcher import run_ccxt_scan
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin
 
@@ -9,6 +11,7 @@ from utils.state import load_seen, save_seen
 from utils.tg import send_telegram_message
 from utils.parse import summarize
 from utils.coingecko import enrich
+
 
 HEADERS = {"User-Agent": "Mozilla/5.0 (cex-listing-bot)"}
 

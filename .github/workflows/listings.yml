@@ -16,14 +16,17 @@ jobs:
   run-bot:
     runs-on: ubuntu-latest
     timeout-minutes: 12
+
     strategy:
       fail-fast: false
       matrix:
         shard: [0, 1, 2, 3]
 
-
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -50,5 +53,14 @@ jobs:
         run: |
           git config user.name "cex-listing-bot"
           git config user.email "cex-listing-bot@users.noreply.github.com"
+
           git add data/seen.json data/seen_ccxt.json
-          git diff --cached --quiet || (git commit -m "update seen listings" && git push)
+
+          # Commit only if something changed
+          git diff --cached --quiet || git commit -m "update seen listings"
+
+          # Rebase onto remote (prevents 'fetch first' rejects if a run overlaps)
+          git pull --rebase origin main || true
+
+          # Push (don't fail workflow if push conflicts once; next run will push)
+          git push || true

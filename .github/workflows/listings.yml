@@ -16,6 +16,7 @@ permissions:
 jobs:
   run-bot:
     runs-on: ubuntu-latest
+    timeout-minutes: 12
     strategy:
       matrix:
         shard: [0, 1, 2, 3]

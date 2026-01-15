@@ -106,9 +106,10 @@ def build_message(
     dex_url: Optional[str],
     found_at: str
 ) -> str:
+    ex_up = (exchange_id or "").upper()
     lines = [
         "🆕 NEW (CCXT DETECTED)",
-        f"Exchange: {exchange_id}",
+        f"Exchange: {ex_up}",
         f"Ticker: {ticker}",
         f"Contract: {contract or 'n/a'}",
         f"Found: {found_at}",
@@ -125,7 +126,7 @@ def run_ccxt_scan(
     max_exchanges_per_run: int = 35,
     skip_common_on_first_run: bool = True,
 ) -> None:
-    # Load state dict: {"seen": { "exchange:ticker": "timestamp", ... }}
+    # Load state dict: {"seen": { "EXCHANGE:TICKER": "timestamp", ... }}
     state = load_state(STATE_PATH)
     seen_map: Dict[str, str] = state["seen"]
 
@@ -136,6 +137,7 @@ def run_ccxt_scan(
     first_run = (len(seen_map) == 0)
 
     for eid in shard_ids:
+        eid_up = (eid or "").upper()
         try:
             ex_class = getattr(ccxt, eid)
             ex = ex_class({"enableRateLimit": True, "timeout": 20000})
@@ -157,7 +159,7 @@ def run_ccxt_scan(
                 if first_run and skip_common_on_first_run and ticker in DEFAULT_SKIP:
                     continue
 
-                key = f"{eid}:{ticker}"
+                key = f"{eid_up}:{ticker}"
                 if key in seen_map:
                     continue
 
@@ -167,7 +169,7 @@ def run_ccxt_scan(
                 contract, cg_id, dex_url = resolve_contract_and_refs(ticker, c)
 
                 send_telegram_message(
-                    build_message(eid, ticker, contract, cg_id, dex_url, found_at)
+                    build_message(eid_up, ticker, contract, cg_id, dex_url, found_at)
                 )
 
                 time.sleep(0.6)

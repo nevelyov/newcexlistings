@@ -13,7 +13,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        shard: [0, 1, 2, 3]
+        shard: [0, 1]
     steps:
       - uses: actions/checkout@v4
 
@@ -31,7 +31,7 @@ jobs:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           SHARD_INDEX: ${{ matrix.shard }}
-          SHARD_TOTAL: "4"
+          SHARD_TOTAL: "2"
           # optional: avoid CoinGecko 429
           DISABLE_COINGECKO: "1"
         run: |

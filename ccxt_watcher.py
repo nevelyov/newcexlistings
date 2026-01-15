@@ -15,18 +15,14 @@ from utils.dexscreener import (
 )
 
 STATE_PATH = "data/seen_ccxt.json"
-
-# Optional: skip ultra-common tickers on first run (reduces spam)
 DEFAULT_SKIP = {"USDT", "USDC", "BTC", "ETH", "BNB", "SOL"}
 
 
 def _as_dict(x) -> dict:
-    """Some exchanges return weird shapes (list/str/None). Force dict."""
     return x if isinstance(x, dict) else {}
 
 
 def _safe_get_contract_from_currency(currency: dict) -> Optional[str]:
-    """Rare case: exchange returns contract info in currencies metadata."""
     if not isinstance(currency, dict):
         return None
 
@@ -49,30 +45,19 @@ def _safe_get_contract_from_currency(currency: dict) -> Optional[str]:
     return pick_best_contract(candidates) if candidates else None
 
 
-def resolve_contract_and_refs(
-    ticker: str,
-    currency_obj: dict
-) -> Tuple[Optional[str], Optional[str], Optional[str]]:
-    """
-    Returns: (contract, coingecko_id, dexscreener_pair_url)
-    Contract pipeline:
-      1) Exchange metadata (rare)
-      2) Scan exchange raw info for 0x...
-      3) CoinGecko platforms + return CoinGecko ID
-      4) DexScreener fallback: contract + pair url
-    """
+def resolve_contract_and_refs(ticker: str, currency_obj: dict) -> Tuple[Optional[str], Optional[str], Optional[str]]:
     t = (ticker or "").upper().strip()
     if not t:
         return None, None, None
 
     currency_obj = currency_obj if isinstance(currency_obj, dict) else {}
 
-    # 1) Exchange metadata
+    # 1) exchange metadata
     contract = _safe_get_contract_from_currency(currency_obj)
     if contract:
         return contract, None, None
 
-    # 2) Raw info scan (info may be list/str/etc)
+    # 2) raw scan
     raw = str(currency_obj.get("info") or "")
     cands = extract_contracts(raw)
     contract = pick_best_contract(cands)
@@ -81,7 +66,7 @@ def resolve_contract_and_refs(
 
     coingecko_id = None
 
-    # 3) CoinGecko (ID + platforms)
+    # 3) CoinGecko
     try:
         hit = search_coin(t)
         if hit and hit.get("id"):
@@ -95,7 +80,7 @@ def resolve_contract_and_refs(
     except Exception:
         pass
 
-    # 4) DexScreener fallback
+    # 4) DexScreener
     try:
         pair = dex_search(t)
         addr = extract_contract_from_pair(pair)
@@ -109,26 +94,17 @@ def resolve_contract_and_refs(
 
 
 def _mdv2_escape(s: str) -> str:
-    # Telegram MarkdownV2 special chars:
-    # _ * [ ] ( ) ~ ` > # + - = | { } . !
     for ch in r"_*[]()~`>#+-=|{}.!":
         s = s.replace(ch, "\\" + ch)
     return s
 
 
-def build_message(
-    exchange_id: str,
-    ticker: str,
-    contract: Optional[str],
-    cg_id: Optional[str],
-    dex_url: Optional[str],
-    found_at: str
-) -> str:
+def build_message(exchange_id: str, ticker: str, contract: Optional[str],
+                  cg_id: Optional[str], dex_url: Optional[str], found_at: str) -> str:
     ex_up = _mdv2_escape((exchange_id or "").upper())
     t = _mdv2_escape(ticker or "")
     fa = _mdv2_escape(found_at or "")
 
-    # monospace contract (MarkdownV2) = wrap with backticks
     if contract:
         c = f"`{_mdv2_escape(contract)}`"
     else:
@@ -154,13 +130,10 @@ def run_ccxt_scan(
     max_exchanges_per_run: int = 35,
     skip_common_on_first_run: bool = True,
 ) -> None:
-    """
-    HARD TIME LIMIT:
-    Each shard exits after MAX_SECONDS so GitHub job won't spin forever.
-    """
-    # ---- Hard runtime budget per shard ----
+    # ---- HARD limits to always finish before GitHub timeout ----
     start = time.time()
-    MAX_SECONDS = 8 * 60  # 8 minutes per shard; adjust if needed
+    MAX_SECONDS = 6 * 60              # whole shard budget (6 min)
+    MAX_EXCHANGE_SECONDS = 30         # budget per exchange (30 sec)
 
     state = load_state(STATE_PATH)
     seen_map: Dict[str, str] = state["seen"]
@@ -172,30 +145,39 @@ def run_ccxt_scan(
     first_run = (len(seen_map) == 0)
 
     for eid in shard_ids:
-        # stop if time budget exceeded
         if time.time() - start > MAX_SECONDS:
             break
+
+        ex_start = time.time()
 
         try:
             ex_class = getattr(ccxt, eid)
             ex = ex_class({
                 "enableRateLimit": True,
-                "timeout": 20000,
+                "timeout": 12000,  # reduce hanging
             })
 
-            # Some exchanges hang — try/catch and continue
+            # load_markets can hang — keep exchange budget
             try:
                 ex.load_markets()
             except Exception:
                 pass
+
+            # if exchange already ate too much time, skip it
+            if time.time() - ex_start > MAX_EXCHANGE_SECONDS:
+                continue
 
             currencies: Dict[str, Any] = getattr(ex, "currencies", None) or {}
             if not isinstance(currencies, dict) or not currencies:
                 continue
 
             for code, ccy in currencies.items():
-                # stop if time budget exceeded
+                # global timeout
                 if time.time() - start > MAX_SECONDS:
+                    break
+
+                # per-exchange timeout
+                if time.time() - ex_start > MAX_EXCHANGE_SECONDS:
                     break
 
                 ticker = (code or "").upper().strip()
@@ -210,16 +192,14 @@ def run_ccxt_scan(
                     continue
 
                 found_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-                seen_map[key] = found_at  # store timestamp immediately
+                seen_map[key] = found_at
 
                 contract, cg_id, dex_url = resolve_contract_and_refs(ticker, ccy)
 
-                send_telegram_message(
-                    build_message(eid, ticker, contract, cg_id, dex_url, found_at)
-                )
+                send_telegram_message(build_message(eid, ticker, contract, cg_id, dex_url, found_at))
 
-                # IMPORTANT: prevent Telegram 429 bursts across 4 shards
-                time.sleep(2.0)
+                # small pause only to be polite
+                time.sleep(0.25)
 
         except Exception:
             traceback.print_exc()

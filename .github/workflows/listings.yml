@@ -46,6 +46,7 @@ jobs:
           python bot.py
 
       - name: Commit state if changed
+        if: matrix.shard == 0
         run: |
           git config user.name "cex-listing-bot"
           git config user.email "cex-listing-bot@users.noreply.github.com"

@@ -1,1 +1,48 @@
+exchanges:
+  - name: Binance
+    type: html
+    url: "https://www.binance.com/en/support/announcement"
+    link_contains: "/en/support/announcement/detail/"
+    keywords_any: ["will list", "new listing", "introduce"]
 
+  - name: OKX
+    type: html
+    url: "https://www.okx.com/help/section/announcements-new-listings"
+    link_contains: "/help/"
+    keywords_any: ["to list", "will launch", "spot trading", "listing"]
+
+  - name: Bybit
+    type: html
+    url: "https://announcements.bybit.com/en/?category=new_crypto"
+    link_contains: "/en/article/"
+    keywords_any: ["to list", "listing", "new listing"]
+
+  - name: KuCoin
+    type: html
+    url: "https://www.kucoin.com/announcement/new-listings"
+    link_contains: "/announcement/"
+    keywords_any: ["will add", "will list", "world premiere", "gets listed"]
+
+  - name: MEXC
+    type: html
+    url: "https://www.mexc.com/announcements/new-listings"
+    link_contains: "/announcements/"
+    keywords_any: ["will list", "open trading", "innovation zone"]
+
+  - name: Gate.io
+    type: html
+    url: "https://www.gate.io/announcements/newlisted"
+    link_contains: "/announcements/"
+    keywords_any: ["initial listing", "to list", "spot trading"]
+
+  - name: Bitget
+    type: html
+    url: "https://www.bitget.com/support/categories/11865590960081"
+    link_contains: "/support/"
+    keywords_any: ["initial listing", "will list", "listed", "spot"]
+
+  - name: HTX
+    type: html
+    url: "https://www.htx.com/en-in/support/list/360000039942"
+    link_contains: "/support/"
+    keywords_any: ["will list", "open trading", "to open trading"]

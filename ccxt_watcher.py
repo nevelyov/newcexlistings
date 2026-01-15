@@ -2,13 +2,12 @@ import ccxt
 import time
 import traceback
 from typing import Optional, Dict, Any, Tuple
-
-from utils.state2 import load_state, save_state
 from datetime import datetime, timezone
 
+from utils.state2 import load_state, save_state
 from utils.tg import send_telegram_message
 from utils.parse import pick_best_contract, extract_contracts
-from utils.coingecko import enrich, search_coin  # <-- we use search_coin to get CoinGecko ID
+from utils.coingecko import enrich, search_coin
 from utils.dexscreener import (
     search as dex_search,
     extract_contract_from_pair,
@@ -17,9 +16,11 @@ from utils.dexscreener import (
 
 STATE_PATH = "data/seen_ccxt.json"
 
+# Optional: skip ultra-common tickers on first run (reduces spam)
 DEFAULT_SKIP = {"USDT", "USDC", "BTC", "ETH", "BNB", "SOL"}
 
 def _safe_get_contract_from_currency(currency: dict) -> Optional[str]:
+    """Rare case: exchange returns contract info in currencies metadata."""
     if not currency:
         return None
 
@@ -41,15 +42,17 @@ def _safe_get_contract_from_currency(currency: dict) -> Optional[str]:
 
     return pick_best_contract(candidates) if candidates else None
 
-def resolve_contract_and_refs(ticker: str, currency_obj: dict) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+def resolve_contract_and_refs(
+    ticker: str,
+    currency_obj: dict
+) -> Tuple[Optional[str], Optional[str], Optional[str]]:
     """
     Returns: (contract, coingecko_id, dexscreener_pair_url)
-
-    Pipeline:
-      1) Exchange metadata contract (rare)
-      2) Scan raw exchange info for contract
-      3) CoinGecko: get ID + platforms contract
-      4) DexScreener: contract + pair url
+    Contract pipeline:
+      1) Exchange metadata (rare)
+      2) Scan exchange raw info for 0x...
+      3) CoinGecko platforms + return CoinGecko ID
+      4) DexScreener fallback: contract + pair url
     """
     t = (ticker or "").upper().strip()
     if not t:
@@ -69,21 +72,21 @@ def resolve_contract_and_refs(ticker: str, currency_obj: dict) -> Tuple[Optional
 
     coingecko_id = None
 
-    # 3) CoinGecko (ID + platforms contract)
+    # 3) CoinGecko (ID + platforms)
     try:
-        hit = search_coin(t)  # returns first search match dict with 'id'
+        hit = search_coin(t)
         if hit and hit.get("id"):
             coingecko_id = hit["id"]
 
-        cg = enrich(t)  # uses coin_data() internally (best-effort)
+        cg = enrich(t)
         plats = cg.get("platform_contracts") or {}
-        for _, addr in plats controlled to ignore some:
-            if addr:
+        for _, addr in plats.items():
+            if isinstance(addr, str) and addr:
                 return addr, coingecko_id, None
     except Exception:
         pass
 
-    # 4) DexScreener fallback (contract + pair URL)
+    # 4) DexScreener fallback
     try:
         pair = dex_search(t)
         addr = extract_contract_from_pair(pair)
@@ -95,12 +98,20 @@ def resolve_contract_and_refs(ticker: str, currency_obj: dict) -> Tuple[Optional
 
     return None, coingecko_id, None
 
-def build_message(exchange_id: str, ticker: str, contract: Optional[str], cg_id: Optional[str], dex_url: Optional[str]) -> str:
+def build_message(
+    exchange_id: str,
+    ticker: str,
+    contract: Optional[str],
+    cg_id: Optional[str],
+    dex_url: Optional[str],
+    found_at: str
+) -> str:
     lines = [
         "🆕 NEW (CCXT DETECTED)",
         f"Exchange: {exchange_id}",
         f"Ticker: {ticker}",
         f"Contract: {contract or 'n/a'}",
+        f"Found: {found_at}",
     ]
     if cg_id:
         lines.append(f"CoinGecko ID: {cg_id}")
@@ -114,14 +125,15 @@ def run_ccxt_scan(
     max_exchanges_per_run: int = 35,
     skip_common_on_first_run: bool = True,
 ) -> None:
-    seen = load_set(STATE_PATH)
-    new_seen = set(seen)
+    # Load state dict: {"seen": { "exchange:ticker": "timestamp", ... }}
+    state = load_state(STATE_PATH)
+    seen_map: Dict[str, str] = state["seen"]
 
     ids = ccxt.exchanges
     shard_ids = [eid for i, eid in enumerate(ids) if (i % shard_total) == shard_index]
     shard_ids = shard_ids[:max_exchanges_per_run]
 
-    first_run = (len(seen) == 0)
+    first_run = (len(seen_map) == 0)
 
     for eid in shard_ids:
         try:
@@ -146,19 +158,23 @@ def run_ccxt_scan(
                     continue
 
                 key = f"{eid}:{ticker}"
-                if key in seen:
+                if key in seen_map:
                     continue
+
+                found_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+                seen_map[key] = found_at  # store timestamp immediately (prevents duplicate spam)
 
                 contract, cg_id, dex_url = resolve_contract_and_refs(ticker, c)
 
-                send_telegram_message(build_message(eid, ticker, contract, cg_id, dex_url))
+                send_telegram_message(
+                    build_message(eid, ticker, contract, cg_id, dex_url, found_at)
+                )
 
-                new_seen.add(key)
                 time.sleep(0.6)
 
         except Exception:
             traceback.print_exc()
             continue
 
-    if new_seen != seen:
-        save_set(STATE_PATH, new_seen)
+    # Save updated timestamps
+    save_state(STATE_PATH, state)

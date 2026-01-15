@@ -108,6 +108,14 @@ def resolve_contract_and_refs(
     return None, coingecko_id, None
 
 
+def _mdv2_escape(s: str) -> str:
+    # Telegram MarkdownV2 special chars:
+    # _ * [ ] ( ) ~ ` > # + - = | { } . !
+    for ch in r"_*[]()~`>#+-=|{}.!":
+        s = s.replace(ch, "\\" + ch)
+    return s
+
+
 def build_message(
     exchange_id: str,
     ticker: str,
@@ -116,18 +124,27 @@ def build_message(
     dex_url: Optional[str],
     found_at: str
 ) -> str:
-    ex_up = (exchange_id or "").upper()
+    ex_up = _mdv2_escape((exchange_id or "").upper())
+    t = _mdv2_escape(ticker or "")
+    fa = _mdv2_escape(found_at or "")
+
+    # monospace contract (MarkdownV2) = wrap with backticks
+    if contract:
+        c = f"`{_mdv2_escape(contract)}`"
+    else:
+        c = "n/a"
+
     lines = [
-        "🆕 NEW (CCXT DETECTED)",
-        f"Exchange: {ex_up}",
-        f"Ticker: {ticker}",
-        f"Contract: {contract or 'n/a'}",
-        f"Found: {found_at}",
+        "🆕 *NEW* \\(CCXT DETECTED\\)",
+        f"*Exchange:* {ex_up}",
+        f"*Ticker:* {t}",
+        f"*Contract:* {c}",
+        f"*Found:* {fa}",
     ]
     if cg_id:
-        lines.append(f"CoinGecko ID: {cg_id}")
+        lines.append(f"*CoinGecko ID:* {_mdv2_escape(cg_id)}")
     if dex_url:
-        lines.append(f"DexScreener: {dex_url}")
+        lines.append(f"*DexScreener:* {_mdv2_escape(dex_url)}")
     return "\n".join(lines)
 
 
@@ -176,7 +193,7 @@ def run_ccxt_scan(
             if not isinstance(currencies, dict) or not currencies:
                 continue
 
-            for code, c in currencies.items():
+            for code, ccy in currencies.items():
                 # stop if time budget exceeded
                 if time.time() - start > MAX_SECONDS:
                     break
@@ -195,7 +212,7 @@ def run_ccxt_scan(
                 found_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
                 seen_map[key] = found_at  # store timestamp immediately
 
-                contract, cg_id, dex_url = resolve_contract_and_refs(ticker, c)
+                contract, cg_id, dex_url = resolve_contract_and_refs(ticker, ccy)
 
                 send_telegram_message(
                     build_message(eid, ticker, contract, cg_id, dex_url, found_at)

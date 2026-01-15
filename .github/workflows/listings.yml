@@ -20,9 +20,6 @@ jobs:
       fail-fast: false
       matrix:
         shard: [0, 1, 2, 3]
-        
-  matrix:
-    shard: [0, 1, 2, 3]
 
 
     steps:

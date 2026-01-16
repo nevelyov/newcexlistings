@@ -1,245 +1,264 @@
-import os
-import json
-import hashlib
-import requests
-import yaml
-from bs4 import BeautifulSoup
-from urllib.parse import urljoin
+import ccxt
+import time
+import traceback
+from typing import Optional, Dict, Any, Tuple
+from datetime import datetime, timezone
 
-from ccxt_watcher import run_ccxt_scan
-from utils.state import load_seen, save_seen
+from utils.state2 import load_state, save_state
 from utils.tg import send_telegram_message
-from utils.parse import summarize
-from utils.coingecko import enrich
+from utils.parse import pick_best_contract, extract_contracts
+from utils.coingecko import enrich, search_coin
+from utils.dexscreener import (
+    search as dex_search,
+    extract_contract_from_pair,
+    extract_pair_url,
+)
 
-HEADERS = {"User-Agent": "Mozilla/5.0 (cex-listing-bot)"}
-
-
-def stable_id(exchange: str, url: str, title: str) -> str:
-    base = f"{exchange}|{url}|{title}".encode("utf-8")
-    return hashlib.sha256(base).hexdigest()[:24]
-
-
-def fetch_html(url: str) -> str:
-    r = requests.get(url, timeout=30, headers=HEADERS)
-    r.raise_for_status()
-    return r.text
+STATE_PATH = "data/seen_ccxt.json"
+DEFAULT_SKIP = {"USDT", "USDC", "BTC", "ETH", "BNB", "SOL"}
 
 
-def parse_listing_links(cfg: dict) -> list[dict]:
-    html = fetch_html(cfg["url"])
-    soup = BeautifulSoup(html, "lxml")
+def _as_dict(x) -> dict:
+    return x if isinstance(x, dict) else {}
 
-    items = []
-    for a in soup.find_all("a", href=True):
-        href = a["href"]
-        text = a.get_text(" ", strip=True)
 
-        if cfg.get("link_contains") and (cfg["link_contains"] not in href):
+def _mdv2_escape(s: str) -> str:
+    for ch in r"_*[]()~`>#+-=|{}.!":
+        s = s.replace(ch, "\\" + ch)
+    return s
+
+
+def _safe_get_contract_and_chain_from_currency(currency: dict) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Пытаемся достать contract (+chain/network, если есть) из ccxt currency object.
+    Возвращает (contract, chain) или (None, None)
+    """
+    if not isinstance(currency, dict):
+        return None, None
+
+    info = _as_dict(currency.get("info"))
+
+    # 1) simple keys in currency.info
+    for k in ["contractAddress", "contract_address", "tokenAddress", "address", "contract"]:
+        v = info.get(k)
+        if isinstance(v, str) and v:
+            # chain иногда лежит рядом
+            chain = info.get("network") or info.get("chain") or info.get("chainName")
+            if isinstance(chain, str) and chain.strip():
+                return v, chain.strip()
+            return v, None
+
+    # 2) networks dict
+    networks = currency.get("networks") if isinstance(currency.get("networks"), dict) else {}
+    candidates = []
+    for net_name, obj in networks.items():
+        if not isinstance(obj, dict):
             continue
+        inf = _as_dict(obj.get("info"))
+        for k in ["contractAddress", "contract_address", "tokenAddress", "address", "contract"]:
+            v = inf.get(k)
+            if isinstance(v, str) and v:
+                # net_name в ccxt часто = chain
+                chain = None
+                if isinstance(net_name, str) and net_name.strip():
+                    chain = net_name.strip()
+                # или в info
+                alt = inf.get("network") or inf.get("chain") or inf.get("chainName")
+                if isinstance(alt, str) and alt.strip():
+                    chain = alt.strip()
+                candidates.append((v, chain))
 
-        if href.startswith("/"):
-            href = urljoin(cfg["url"], href)
+    if not candidates:
+        return None, None
 
-        if not text:
-            continue
-
-        low = text.lower()
-        kws = [k.lower() for k in cfg.get("keywords_any", [])]
-        if kws and not any(k in low for k in kws):
-            continue
-
-        items.append({"title": text, "url": href})
-
-    seen_urls = set()
-    out = []
-    for it in items:
-        if it["url"] in seen_urls:
-            continue
-        seen_urls.add(it["url"])
-        out.append(it)
-
-    return out[:40]
+    # pick_best_contract выбирает адрес, но chain нужно сопоставить.
+    addrs = [a for a, _ in candidates]
+    best = pick_best_contract(addrs)
+    for a, ch in candidates:
+        if a == best:
+            return a, ch
+    return best, None
 
 
-def fetch_detail_text(url: str) -> str:
+def resolve_contract_chain_and_refs(
+    ticker: str,
+    currency_obj: dict
+) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[str]]:
+    """
+    Returns: (contract, chain, coingecko_id, dex_url)
+    chain — если удалось достать (например ETH/BSC/SOL etc), иначе None
+    """
+    t = (ticker or "").upper().strip()
+    if not t:
+        return None, None, None, None
+
+    currency_obj = currency_obj if isinstance(currency_obj, dict) else {}
+
+    # 1) exchange metadata (best)
+    contract, chain = _safe_get_contract_and_chain_from_currency(currency_obj)
+    if contract:
+        return contract, chain, None, None
+
+    # 2) raw scan of info
+    raw = str(currency_obj.get("info") or "")
+    cands = extract_contracts(raw)
+    contract = pick_best_contract(cands)
+    if contract:
+        # chain тут обычно неизвестен
+        return contract, None, None, None
+
+    coingecko_id = None
+
+    # 3) CoinGecko
     try:
-        html = fetch_html(url)
-    except Exception:
-        return ""
-    soup = BeautifulSoup(html, "lxml")
-    return soup.get_text("\n", strip=True)[:20000]
+        hit = search_coin(t)
+        if hit and hit.get("id"):
+            coingecko_id = hit["id"]
 
-
-def fmt_money(x):
-    if x is None:
-        return "n/a"
-    try:
-        x = float(x)
-    except Exception:
-        return "n/a"
-    if x >= 1e9:
-        return f"${x/1e9:.2f}B"
-    if x >= 1e6:
-        return f"${x/1e6:.2f}M"
-    if x >= 1e3:
-        return f"${x/1e3:.2f}K"
-    return f"${x:.2f}"
-
-
-def _html_escape(s: str) -> str:
-    if s is None:
-        return ""
-    return (
-        str(s)
-        .replace("&", "&amp;")
-        .replace("<", "&lt;")
-        .replace(">", "&gt;")
-        .replace('"', "&quot;")
-    )
-
-
-def _load_json_list(path: str) -> list[dict]:
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            x = json.load(f)
-        if isinstance(x, list):
-            return [i for i in x if isinstance(i, dict)]
+        cg = enrich(t)
+        plats = cg.get("platform_contracts") or {}
+        # plats: { "ethereum": "0x...", "binance-smart-chain": "0x..." ... }
+        if isinstance(plats, dict):
+            for ch, addr in plats.items():
+                if isinstance(addr, str) and addr:
+                    chain = ch if isinstance(ch, str) and ch else None
+                    return addr, chain, coingecko_id, None
     except Exception:
         pass
-    return []
 
-
-def _save_json_list(path: str, items: list[dict]) -> None:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+    # 4) DexScreener
     try:
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(items, f, ensure_ascii=False, indent=2)
+        pair = dex_search(t)
+        addr = extract_contract_from_pair(pair)
+        url = extract_pair_url(pair)
+        # chain может быть внутри pair (зависит от твоей реализации utils.dexscreener)
+        chain = None
+        if isinstance(pair, dict):
+            chain = pair.get("chainId") or pair.get("chain") or pair.get("network")
+            if isinstance(chain, str):
+                chain = chain.strip() or None
+        return addr, chain, coingecko_id, url
     except Exception:
         pass
 
-
-def _flush_pending_html(max_to_send: int = 2) -> None:
-    path = "data/pending_html.json"
-    pending = _load_json_list(path)
-    if not pending:
-        return
-
-    still = []
-    sent = 0
-    for item in pending:
-        if sent >= max_to_send:
-            still.append(item)
-            continue
-        text = item.get("text")
-        ok = send_telegram_message(text, parse_mode="HTML", disable_web_page_preview=True)
-        if ok:
-            sent += 1
-        else:
-            still.append(item)
-    _save_json_list(path, still)
+    return None, None, coingecko_id, None
 
 
-def run_announcements_scan(max_messages: int) -> None:
-    with open("config/exchanges.yaml", "r", encoding="utf-8") as f:
-        cfg = yaml.safe_load(f) or {}
+def build_message(
+    exchange_id: str,
+    ticker: str,
+    contract: Optional[str],
+    chain: Optional[str],
+    cg_id: Optional[str],
+    dex_url: Optional[str],
+    found_at: str
+) -> str:
+    ex_up = _mdv2_escape((exchange_id or "").upper())
+    t = _mdv2_escape(ticker or "")
+    fa = _mdv2_escape(found_at or "")
 
-    exchanges = cfg.get("exchanges", []) or []
+    if contract:
+        c = f"`{_mdv2_escape(contract)}`"
+    else:
+        c = "n/a"
 
-    seen = load_seen()
-    new_seen = set(seen)
+    lines = [
+        "🆕 *NEW* \\(CCXT DETECTED\\)",
+        f"*Exchange:* {ex_up}",
+        f"*Ticker:* {t}",
+    ]
 
-    pending_path = "data/pending_html.json"
-    pending = _load_json_list(pending_path)
+    # chain показываем только если есть
+    if chain:
+        lines.append(f"*Chain:* {_mdv2_escape(chain)}")
 
-    sent = 0
+    lines += [
+        f"*Contract:* {c}",
+        f"*Found:* {fa}",
+    ]
 
-    for ex in exchanges:
-        if sent >= max_messages:
+    if cg_id:
+        lines.append(f"*CoinGecko ID:* {_mdv2_escape(cg_id)}")
+    if dex_url:
+        lines.append(f"*DexScreener:* {_mdv2_escape(dex_url)}")
+    return "\n".join(lines)
+
+
+def run_ccxt_scan(
+    shard_index: int = 0,
+    shard_total: int = 4,
+    max_exchanges_per_run: int = 35,
+    skip_common_on_first_run: bool = True,
+) -> None:
+    # ---- HARD limits to always finish before GitHub timeout ----
+    start = time.time()
+    MAX_SECONDS = 6 * 60              # whole shard budget (6 min)
+    MAX_EXCHANGE_SECONDS = 30         # budget per exchange (30 sec)
+
+    state = load_state(STATE_PATH)
+    seen_map: Dict[str, str] = state["seen"]
+
+    ids = ccxt.exchanges
+    shard_ids = [eid for i, eid in enumerate(ids) if (i % shard_total) == shard_index]
+    shard_ids = shard_ids[:max_exchanges_per_run]
+
+    first_run = (len(seen_map) == 0)
+
+    for eid in shard_ids:
+        if time.time() - start > MAX_SECONDS:
             break
-        if ex.get("type") != "html":
-            continue
 
-        ex_name = (ex.get("name") or "").strip()
-        if not ex_name:
-            continue
+        ex_start = time.time()
 
         try:
-            links = parse_listing_links(ex)
-        except Exception:
-            continue
+            ex_class = getattr(ccxt, eid)
+            ex = ex_class({
+                "enableRateLimit": True,
+                "timeout": 12000,  # reduce hanging
+            })
 
-        for it in links:
-            if sent >= max_messages:
-                break
+            # load_markets can hang — keep exchange budget
+            try:
+                ex.load_markets()
+            except Exception:
+                pass
 
-            sid = stable_id(ex_name, it["url"], it["title"])
-            if sid in seen:
+            if time.time() - ex_start > MAX_EXCHANGE_SECONDS:
                 continue
 
-            detail_text = fetch_detail_text(it["url"])
-            ticker, contract = summarize(it["title"], detail_text)
+            currencies: Dict[str, Any] = getattr(ex, "currencies", None) or {}
+            if not isinstance(currencies, dict) or not currencies:
+                continue
 
-            mc = vol = None
-            cg_contract_hint = None
+            for code, ccy in currencies.items():
+                if time.time() - start > MAX_SECONDS:
+                    break
+                if time.time() - ex_start > MAX_EXCHANGE_SECONDS:
+                    break
 
-            if ticker:
-                cg = enrich(ticker)
-                mc = cg.get("market_cap_usd")
-                vol = cg.get("volume_24h_usd")
-                plats = cg.get("platform_contracts") or {}
-                for chain, addr in plats.items():
-                    if addr:
-                        cg_contract_hint = f"{chain}:{addr}"
-                        break
+                ticker = (code or "").upper().strip()
+                if not ticker:
+                    continue
 
-            contract_final = contract
-            if not contract_final and cg_contract_hint and ":" in cg_contract_hint:
-                contract_final = cg_contract_hint.split(":", 1)[1]
+                if first_run and skip_common_on_first_run and ticker in DEFAULT_SKIP:
+                    continue
 
-            lines = []
-            lines.append("🆕 <b>NEW LISTING</b>")
-            lines.append(f"<b>Exchange:</b> {_html_escape(ex_name.upper())}")
-            lines.append(f"<b>Ticker:</b> {_html_escape((ticker or 'n/a').upper())}")
-            if contract_final:
-                lines.append(f"<b>Contract:</b> <code>{_html_escape(contract_final)}</code>")
-            else:
-                lines.append("<b>Contract:</b> n/a")
-            lines.append(f"<b>24h Vol:</b> {_html_escape(fmt_money(vol))}")
-            lines.append(f"<b>MCap:</b> {_html_escape(fmt_money(mc))}")
-            lines.append(f"<b>Link:</b> {_html_escape(it['url'])}")
+                key = f"{(eid or '').upper()}:{ticker}"
+                if key in seen_map:
+                    continue
 
-            msg = "\n".join(lines)
+                found_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+                seen_map[key] = found_at
 
-            ok = send_telegram_message(msg, parse_mode="HTML", disable_web_page_preview=True)
-            if ok:
-                sent += 1
-            else:
-                pending.append({"text": msg})
-                # не увеличиваем sent, чтобы не сжечь лимит
-                # но идём дальше
+                contract, chain, cg_id, dex_url = resolve_contract_chain_and_refs(ticker, ccy)
 
-            new_seen.add(sid)
+                send_telegram_message(
+                    build_message(eid, ticker, contract, chain, cg_id, dex_url, found_at),
+                    parse_mode="MarkdownV2"
+                )
 
-    if new_seen != seen:
-        save_seen(new_seen)
+        except Exception:
+            traceback.print_exc()
+            continue
 
-    _save_json_list(pending_path, pending)
-
-
-def main():
-    shard_index = int(os.getenv("SHARD_INDEX", "0"))
-    shard_total = int(os.getenv("SHARD_TOTAL", "4"))
-
-    # 1) CCXT scan (per shard)
-    run_ccxt_scan(shard_index=shard_index, shard_total=shard_total)
-
-    # 2) HTML scan only on shard 0
-    if shard_index == 0:
-        _flush_pending_html(max_to_send=2)
-        html_max = int(os.getenv("HTML_MAX_MSG", "4"))
-        run_announcements_scan(max_messages=html_max)
-
-
-if __name__ == "__main__":
-    main()
+    save_state(STATE_PATH, state)

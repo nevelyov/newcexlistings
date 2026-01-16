@@ -50,15 +50,16 @@ jobs:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           TG_CHAT_IDS: ${{ secrets.TG_CHAT_IDS }}
+
           SHARD_INDEX: ${{ matrix.shard }}
           SHARD_TOTAL: "4"
           DISABLE_COINGECKO: "0"
 
-          # ✅ (1) Telegram anti-429: min delay between messages (per shard process)
-          TG_MIN_INTERVAL: "1.0"
-
-          # ✅ (2) Limit HTML announcements spam per run
-          HTML_MAX_MSG: "8"
+          # ✅ HARD anti-429 mode
+          TG_MIN_INTERVAL: "1.6"
+          TG_JITTER: "0.35"
+          CCXT_MAX_MSG_PER_SHARD: "4"
+          HTML_MAX_MSG: "4"
         run: |
           python bot.py
 

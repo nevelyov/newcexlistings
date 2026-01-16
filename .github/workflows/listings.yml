@@ -53,6 +53,12 @@ jobs:
           SHARD_INDEX: ${{ matrix.shard }}
           SHARD_TOTAL: "4"
           DISABLE_COINGECKO: "0"
+
+          # ✅ (1) Telegram anti-429: min delay between messages (per shard process)
+          TG_MIN_INTERVAL: "1.0"
+
+          # ✅ (2) Limit HTML announcements spam per run
+          HTML_MAX_MSG: "8"
         run: |
           python bot.py
 

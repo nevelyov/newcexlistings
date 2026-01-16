@@ -1,7 +1,7 @@
 import os
 import time
 import requests
-from typing import List, Optional
+from typing import List
 
 API = "https://api.telegram.org"
 
@@ -16,7 +16,7 @@ def _parse_chat_ids() -> List[str]:
       - TG_CHAT_ID="123"
       - TG_CHAT_IDS="-1001, -1002, 123"
     """
-    ids = []
+    ids: List[str] = []
     one = (os.getenv("TG_CHAT_ID") or "").strip()
     many = (os.getenv("TG_CHAT_IDS") or "").strip()
 
@@ -30,7 +30,7 @@ def _parse_chat_ids() -> List[str]:
                 ids.append(p)
 
     # unique preserve order
-    out = []
+    out: List[str] = []
     seen = set()
     for x in ids:
         if x not in seen:
@@ -39,7 +39,7 @@ def _parse_chat_ids() -> List[str]:
     return out
 
 
-def _sleep_for_rate_limit():
+def _sleep_for_rate_limit() -> None:
     global _LAST_SEND_TS
     now = time.time()
     wait = (_LAST_SEND_TS + _MIN_INTERVAL_SECONDS) - now
@@ -54,8 +54,17 @@ def send_telegram_message(
     disable_web_page_preview: bool = True,
     max_retries: int = 6,
 ) -> None:
+    """
+    Best-effort sender:
+    - soft local rate limit
+    - retries with backoff
+    - handles 429 retry_after
+    """
     token = (os.getenv("TG_BOT_TOKEN") or "").strip()
     if not token:
+        return
+
+    if not isinstance(text, str) or not text.strip():
         return
 
     chat_ids = _parse_chat_ids()
@@ -72,7 +81,6 @@ def send_telegram_message(
             "disable_web_page_preview": disable_web_page_preview,
         }
 
-        # retry loop per chat_id
         attempt = 0
         while True:
             attempt += 1
@@ -102,11 +110,11 @@ def send_telegram_message(
                 if attempt >= max_retries:
                     break
 
-                # ждём сколько сказал Telegram (и чуть сверху)
                 time.sleep(min(retry_after + 1, 60))
                 continue
 
-            # другие ошибки — не валим весь бот, просто уходим
+            # other errors: retry a few times, then stop for this chat_id
             if attempt >= max_retries:
                 break
+
             time.sleep(min(2 ** attempt, 20))

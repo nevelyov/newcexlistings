@@ -94,6 +94,7 @@ def resolve_contract_and_refs(ticker: str, currency_obj: dict) -> Tuple[Optional
 
 
 def _mdv2_escape(s: str) -> str:
+    s = s or ""
     for ch in r"_*[]()~`>#+-=|{}.!":
         s = s.replace(ch, "\\" + ch)
     return s
@@ -102,7 +103,7 @@ def _mdv2_escape(s: str) -> str:
 def build_message(exchange_id: str, ticker: str, contract: Optional[str],
                   cg_id: Optional[str], dex_url: Optional[str], found_at: str) -> str:
     ex_up = _mdv2_escape((exchange_id or "").upper())
-    t = _mdv2_escape(ticker or "")
+    t = _mdv2_escape((ticker or "").upper())
     fa = _mdv2_escape(found_at or "")
 
     if contract:
@@ -131,9 +132,11 @@ def run_ccxt_scan(
     skip_common_on_first_run: bool = True,
 ) -> None:
     # ---- HARD limits to always finish before GitHub timeout ----
+    # 8.5 минут на шард (чтобы 4 шарда + install deps укладывались в 20 минут джобы)
     start = time.time()
-    MAX_SECONDS = 6 * 60              # whole shard budget (6 min)
-    MAX_EXCHANGE_SECONDS = 30         # budget per exchange (30 sec)
+    MAX_SECONDS = int(float(__import__("os").getenv("CCXT_SHARD_BUDGET_SECONDS", "510")))  # 8m30s
+    MAX_EXCHANGE_SECONDS = int(float(__import__("os").getenv("CCXT_EXCHANGE_BUDGET_SECONDS", "25")))
+    MAX_MSG_PER_SHARD = int(float(__import__("os").getenv("CCXT_MAX_MSG_PER_SHARD", "12")))
 
     state = load_state(STATE_PATH)
     seen_map: Dict[str, str] = state["seen"]
@@ -143,9 +146,12 @@ def run_ccxt_scan(
     shard_ids = shard_ids[:max_exchanges_per_run]
 
     first_run = (len(seen_map) == 0)
+    sent = 0
 
     for eid in shard_ids:
         if time.time() - start > MAX_SECONDS:
+            break
+        if sent >= MAX_MSG_PER_SHARD:
             break
 
         ex_start = time.time()
@@ -154,16 +160,15 @@ def run_ccxt_scan(
             ex_class = getattr(ccxt, eid)
             ex = ex_class({
                 "enableRateLimit": True,
-                "timeout": 12000,  # reduce hanging
+                "timeout": 12000,  # меньше зависаний
             })
 
-            # load_markets can hang — keep exchange budget
+            # load_markets иногда долго — но мы ограничиваем бюджетом биржи
             try:
                 ex.load_markets()
             except Exception:
                 pass
 
-            # if exchange already ate too much time, skip it
             if time.time() - ex_start > MAX_EXCHANGE_SECONDS:
                 continue
 
@@ -172,12 +177,11 @@ def run_ccxt_scan(
                 continue
 
             for code, ccy in currencies.items():
-                # global timeout
                 if time.time() - start > MAX_SECONDS:
                     break
-
-                # per-exchange timeout
                 if time.time() - ex_start > MAX_EXCHANGE_SECONDS:
+                    break
+                if sent >= MAX_MSG_PER_SHARD:
                     break
 
                 ticker = (code or "").upper().strip()
@@ -187,19 +191,18 @@ def run_ccxt_scan(
                 if first_run and skip_common_on_first_run and ticker in DEFAULT_SKIP:
                     continue
 
-                key = f"{(eid or '').upper()}:{ticker}"
+                ex_up = (eid or "").upper()
+                key = f"{ex_up}:{ticker}"
                 if key in seen_map:
                     continue
 
                 found_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-                seen_map[key] = found_at
+                seen_map[key] = found_at  # сразу пишем, чтобы не спамить дублями
 
                 contract, cg_id, dex_url = resolve_contract_and_refs(ticker, ccy)
 
-                send_telegram_message(build_message(eid, ticker, contract, cg_id, dex_url, found_at))
-
-                # small pause only to be polite
-                time.sleep(0.25)
+                send_telegram_message(build_message(ex_up, ticker, contract, cg_id, dex_url, found_at))
+                sent += 1
 
         except Exception:
             traceback.print_exc()

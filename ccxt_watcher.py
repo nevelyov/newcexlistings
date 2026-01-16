@@ -6,10 +6,7 @@ from typing import List
 
 API = "https://api.telegram.org"
 
-# HARD anti-429: ставится через env TG_MIN_INTERVAL
 _MIN_INTERVAL_SECONDS = float(os.getenv("TG_MIN_INTERVAL", "1.6"))
-
-# jitter чтобы 4 шарда не били одновременно
 _JITTER_SECONDS = float(os.getenv("TG_JITTER", "0.35"))
 
 _LAST_SEND_TS = 0.0
@@ -41,13 +38,11 @@ def _parse_chat_ids() -> List[str]:
 def _sleep_for_rate_limit():
     global _LAST_SEND_TS
     now = time.time()
-
     jitter = random.uniform(0.0, _JITTER_SECONDS) if _JITTER_SECONDS > 0 else 0.0
     earliest = _LAST_SEND_TS + _MIN_INTERVAL_SECONDS + jitter
     wait = earliest - now
     if wait > 0:
         time.sleep(wait)
-
     _LAST_SEND_TS = time.time()
 
 
@@ -55,19 +50,21 @@ def send_telegram_message(
     text: str,
     parse_mode: str = "MarkdownV2",
     disable_web_page_preview: bool = True,
-    max_retries: int = 8,
-) -> None:
+    max_retries: int = 6,
+) -> bool:
     token = (os.getenv("TG_BOT_TOKEN") or "").strip()
     if not token:
-        return
+        return False
     if not isinstance(text, str) or not text.strip():
-        return
+        return True  # nothing to send -> treat as ok
 
     chat_ids = _parse_chat_ids()
     if not chat_ids:
-        return
+        return False
 
     url = f"{API}/bot{token}/sendMessage"
+
+    all_ok = True
 
     for chat_id in chat_ids:
         payload = {
@@ -77,6 +74,7 @@ def send_telegram_message(
             "disable_web_page_preview": disable_web_page_preview,
         }
 
+        ok = False
         attempt = 0
         while attempt < max_retries:
             attempt += 1
@@ -90,6 +88,7 @@ def send_telegram_message(
                 continue
 
             if r.status_code == 200:
+                ok = True
                 break
 
             if r.status_code == 429:
@@ -102,9 +101,13 @@ def send_telegram_message(
 
                 global _LAST_SEND_TS
                 _LAST_SEND_TS = time.time() + retry_after
-
                 time.sleep(min(retry_after + 1, 90))
                 continue
 
             backoff = min(2 ** attempt, 30) + random.uniform(0.0, 0.6)
             time.sleep(backoff)
+
+        if not ok:
+            all_ok = False
+
+    return all_ok

@@ -1,5 +1,4 @@
 name: CEX Listing Watcher
-run-name: "CEX Listing Watcher • ${{ github.event_name }} • shard ${{ matrix.shard }}"
 
 on:
   schedule:
@@ -8,7 +7,7 @@ on:
 
 concurrency:
   group: cex-listing-watcher
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 permissions:
   contents: write
@@ -53,12 +52,9 @@ jobs:
           TG_CHAT_IDS: ${{ secrets.TG_CHAT_IDS }}
           SHARD_INDEX: ${{ matrix.shard }}
           SHARD_TOTAL: "4"
-
-          # максимально без 429:
+          DISABLE_COINGECKO: "0"
           TG_MIN_INTERVAL: "1.6"
           CCXT_MAX_MSG_PER_SHARD: "4"
-
-          DISABLE_COINGECKO: "0"
         run: |
           python bot.py
 

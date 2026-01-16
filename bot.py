@@ -13,11 +13,47 @@ from utils.parse import summarize
 from utils.coingecko import enrich
 
 HEADERS = {"User-Agent": "Mozilla/5.0 (cex-listing-bot)"}
+PENDING_HTML_PATH = "data/pending_html.json"
 
 
 def stable_id(exchange: str, url: str, title: str) -> str:
     base = f"{exchange}|{url}|{title}".encode("utf-8")
     return hashlib.sha256(base).hexdigest()[:24]
+
+
+def _msg_id(text: str, parse_mode: str) -> str:
+    base = f"{parse_mode}||{text}".encode("utf-8")
+    return hashlib.sha256(base).hexdigest()[:24]
+
+
+def _load_json_list(path: str) -> list[dict]:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            x = json.load(f)
+        if isinstance(x, list):
+            return [i for i in x if isinstance(i, dict) and i.get("text")]
+    except Exception:
+        pass
+    return []
+
+
+def _save_json_list(path: str, items: list[dict]) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(items, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
+def _pending_add_unique(pending: list[dict], text: str, parse_mode: str, max_items: int = 200) -> None:
+    pid = _msg_id(text, parse_mode)
+    ids = set([x.get("id") for x in pending if x.get("id")])
+    if pid in ids:
+        return
+    pending.append({"id": pid, "text": text, "parse_mode": parse_mode})
+    if len(pending) > max_items:
+        pending[:] = pending[-max_items:]
 
 
 def fetch_html(url: str) -> str:
@@ -99,31 +135,9 @@ def _html_escape(s: str) -> str:
     )
 
 
-def _load_json_list(path: str) -> list[dict]:
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            x = json.load(f)
-        if isinstance(x, list):
-            return [i for i in x if isinstance(i, dict)]
-    except Exception:
-        pass
-    return []
-
-
-def _save_json_list(path: str, items: list[dict]) -> None:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    try:
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(items, f, ensure_ascii=False, indent=2)
-    except Exception:
-        pass
-
-
-def _flush_pending_html(max_to_send: int = 2) -> None:
-    path = "data/pending_html.json"
-    pending = _load_json_list(path)
+def _flush_pending_html(pending: list[dict], max_to_send: int = 2) -> list[dict]:
     if not pending:
-        return
+        return pending
 
     still = []
     sent = 0
@@ -131,13 +145,13 @@ def _flush_pending_html(max_to_send: int = 2) -> None:
         if sent >= max_to_send:
             still.append(item)
             continue
-        text = item.get("text")
+        text = item.get("text") or ""
         ok = send_telegram_message(text, parse_mode="HTML", disable_web_page_preview=True)
         if ok:
             sent += 1
         else:
             still.append(item)
-    _save_json_list(path, still)
+    return still
 
 
 def run_announcements_scan(max_messages: int) -> None:
@@ -149,8 +163,8 @@ def run_announcements_scan(max_messages: int) -> None:
     seen = load_seen()
     new_seen = set(seen)
 
-    pending_path = "data/pending_html.json"
-    pending = _load_json_list(pending_path)
+    pending = _load_json_list(PENDING_HTML_PATH)
+    pending = _flush_pending_html(pending, max_to_send=2)
 
     sent = 0
 
@@ -215,28 +229,23 @@ def run_announcements_scan(max_messages: int) -> None:
             if ok:
                 sent += 1
             else:
-                pending.append({"text": msg})
-                # не увеличиваем sent, чтобы не сжечь лимит
-                # но идём дальше
+                _pending_add_unique(pending, msg, "HTML", max_items=200)
 
             new_seen.add(sid)
 
     if new_seen != seen:
         save_seen(new_seen)
 
-    _save_json_list(pending_path, pending)
+    _save_json_list(PENDING_HTML_PATH, pending)
 
 
 def main():
     shard_index = int(os.getenv("SHARD_INDEX", "0"))
     shard_total = int(os.getenv("SHARD_TOTAL", "4"))
 
-    # 1) CCXT scan (per shard)
     run_ccxt_scan(shard_index=shard_index, shard_total=shard_total)
 
-    # 2) HTML scan only on shard 0
     if shard_index == 0:
-        _flush_pending_html(max_to_send=2)
         html_max = int(os.getenv("HTML_MAX_MSG", "4"))
         run_announcements_scan(max_messages=html_max)
 

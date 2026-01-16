@@ -23,21 +23,11 @@ def _as_dict(x) -> dict:
 
 
 def _guess_chain_from_contract(addr: Optional[str]) -> Optional[str]:
-    """
-    Very rough guess. If not confident -> None.
-    """
     if not addr or not isinstance(addr, str):
         return None
-
     a = addr.strip()
-    # EVM
     if a.startswith("0x") and len(a) == 42:
         return "EVM"
-
-    # Solana-like base58 (heuristic)
-    if 32 <= len(a) <= 44 and a.isalnum() and not a.startswith("0x"):
-        # could be Solana, but also other chains; keep conservative:
-        return "SOLANA"
     return None
 
 
@@ -101,8 +91,8 @@ def resolve_contract_and_refs(
         plats = cg.get("platform_contracts") or {}
         for chain_key, addr in plats.items():
             if isinstance(addr, str) and addr:
-                # здесь chain “уверенный” (название платформы от coingecko)
-                return addr, coingecko_id, None, (str(chain_key).upper() if chain_key else None)
+                chain_guess = str(chain_key).upper() if chain_key else None
+                return addr, coingecko_id, None, chain_guess
     except Exception:
         pass
 
@@ -113,19 +103,13 @@ def resolve_contract_and_refs(
         url = extract_pair_url(pair)
 
         chain_guess = None
-        try:
-            # DexScreener usually has chainId in pair
-            if isinstance(pair, dict):
-                chain_id = pair.get("chainId") or pair.get("chain_id")
-                if isinstance(chain_id, str) and chain_id:
-                    chain_guess = chain_id.upper()
-        except Exception:
-            pass
+        if isinstance(pair, dict):
+            ch = pair.get("chainId") or pair.get("chain_id")
+            if isinstance(ch, str) and ch:
+                chain_guess = ch.upper()
 
-        if addr:
+        if addr or url:
             return addr, coingecko_id, url, (chain_guess or _guess_chain_from_contract(addr))
-        if url:
-            return None, coingecko_id, url, chain_guess
     except Exception:
         pass
 
@@ -133,6 +117,7 @@ def resolve_contract_and_refs(
 
 
 def _mdv2_escape(s: str) -> str:
+    s = s or ""
     for ch in r"_*[]()~`>#+-=|{}.!":
         s = s.replace(ch, "\\" + ch)
     return s
@@ -148,7 +133,7 @@ def build_message(
     found_at: str
 ) -> str:
     ex_up = _mdv2_escape((exchange_id or "").upper())
-    t = _mdv2_escape(ticker or "")
+    t = _mdv2_escape((ticker or "").upper())
     fa = _mdv2_escape(found_at or "")
 
     if contract:
@@ -161,16 +146,12 @@ def build_message(
         f"*Exchange:* {ex_up}",
         f"*Ticker:* {t}",
     ]
-
-    # chain only if we have it
     if chain:
         lines.append(f"*Chain:* {_mdv2_escape(chain)}")
-
     lines += [
         f"*Contract:* {c}",
         f"*Found:* {fa}",
     ]
-
     if cg_id:
         lines.append(f"*CoinGecko ID:* {_mdv2_escape(cg_id)}")
     if dex_url:
@@ -185,10 +166,14 @@ def run_ccxt_scan(
     max_exchanges_per_run: int = 35,
     skip_common_on_first_run: bool = True,
 ) -> None:
-    # ---- HARD limits to always finish before GitHub timeout ----
+    # ---- HARD limits ----
     start = time.time()
-    MAX_SECONDS = 7 * 60              # shard budget (7 min)
-    MAX_EXCHANGE_SECONDS = 35         # per exchange budget (35 sec)
+    MAX_SECONDS = 7 * 60              # budget per shard
+    MAX_EXCHANGE_SECONDS = 35         # budget per exchange
+
+    # 🔥 важнейшее: лимит сообщений на шард (сильно снижает 429)
+    MAX_MSG_PER_SHARD = int(os.getenv("CCXT_MAX_MSG_PER_SHARD", "8"))
+    sent = 0
 
     state = load_state(STATE_PATH)
     seen_map: Dict[str, str] = state["seen"]
@@ -202,6 +187,8 @@ def run_ccxt_scan(
     for eid in shard_ids:
         if time.time() - start > MAX_SECONDS:
             break
+        if sent >= MAX_MSG_PER_SHARD:
+            break
 
         ex_start = time.time()
 
@@ -212,7 +199,6 @@ def run_ccxt_scan(
                 "timeout": 12000,
             })
 
-            # load_markets can hang; but ok with our exchange budget
             try:
                 ex.load_markets()
             except Exception:
@@ -230,6 +216,8 @@ def run_ccxt_scan(
                     break
                 if time.time() - ex_start > MAX_EXCHANGE_SECONDS:
                     break
+                if sent >= MAX_MSG_PER_SHARD:
+                    break
 
                 ticker = (code or "").upper().strip()
                 if not ticker:
@@ -238,17 +226,16 @@ def run_ccxt_scan(
                 if first_run and skip_common_on_first_run and ticker in DEFAULT_SKIP:
                     continue
 
-                # IMPORTANT: key uses uppercase exchange
                 key = f"{(eid or '').upper()}:{ticker}"
                 if key in seen_map:
                     continue
 
                 found_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-                seen_map[key] = found_at  # store immediately (anti-dup)
+                seen_map[key] = found_at
 
                 contract, cg_id, dex_url, chain = resolve_contract_and_refs(ticker, ccy)
 
-                # IMPORTANT: reduce spam -> send only if we have contract OR at least Dex URL
+                # 🔥 анти-спам: шлём только если есть контракт ИЛИ Dex URL
                 if not contract and not dex_url:
                     continue
 
@@ -257,8 +244,7 @@ def run_ccxt_scan(
                     parse_mode="MarkdownV2",
                     disable_web_page_preview=True,
                 )
-
-                time.sleep(0.15)
+                sent += 1
 
         except Exception:
             traceback.print_exc()

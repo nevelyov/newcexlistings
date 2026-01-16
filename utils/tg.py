@@ -1,12 +1,13 @@
 import os
 import time
+import random
 import requests
 from typing import List
 
 API = "https://api.telegram.org"
 
-# мягкий лимит по сообщениям (чтобы не ловить 429)
-_MIN_INTERVAL_SECONDS = float(os.getenv("TG_MIN_INTERVAL", "0.25"))  # 0.25 сек = 4 msg/sec
+# локальный лимит на процесс (в Actions это ОДИН шард = ОДИН процесс)
+_MIN_INTERVAL_SECONDS = float(os.getenv("TG_MIN_INTERVAL", "0.35"))  # дефолт безопаснее чем 0.25
 _LAST_SEND_TS = 0.0
 
 
@@ -16,7 +17,7 @@ def _parse_chat_ids() -> List[str]:
       - TG_CHAT_ID="123"
       - TG_CHAT_IDS="-1001, -1002, 123"
     """
-    ids: List[str] = []
+    ids = []
     one = (os.getenv("TG_CHAT_ID") or "").strip()
     many = (os.getenv("TG_CHAT_IDS") or "").strip()
 
@@ -30,7 +31,7 @@ def _parse_chat_ids() -> List[str]:
                 ids.append(p)
 
     # unique preserve order
-    out: List[str] = []
+    out = []
     seen = set()
     for x in ids:
         if x not in seen:
@@ -39,7 +40,7 @@ def _parse_chat_ids() -> List[str]:
     return out
 
 
-def _sleep_for_rate_limit() -> None:
+def _sleep_for_rate_limit():
     global _LAST_SEND_TS
     now = time.time()
     wait = (_LAST_SEND_TS + _MIN_INTERVAL_SECONDS) - now
@@ -54,17 +55,8 @@ def send_telegram_message(
     disable_web_page_preview: bool = True,
     max_retries: int = 6,
 ) -> None:
-    """
-    Best-effort sender:
-    - soft local rate limit
-    - retries with backoff
-    - handles 429 retry_after
-    """
     token = (os.getenv("TG_BOT_TOKEN") or "").strip()
     if not token:
-        return
-
-    if not isinstance(text, str) or not text.strip():
         return
 
     chat_ids = _parse_chat_ids()
@@ -82,23 +74,22 @@ def send_telegram_message(
         }
 
         attempt = 0
-        while True:
+        while attempt < max_retries:
             attempt += 1
             _sleep_for_rate_limit()
 
             try:
                 r = requests.post(url, json=payload, timeout=25)
             except Exception:
-                if attempt >= max_retries:
-                    break
-                time.sleep(min(2 ** attempt, 20))
+                # network error
+                backoff = min(2 ** attempt, 20) + random.uniform(0, 0.4)
+                time.sleep(backoff)
                 continue
 
-            # OK
             if r.status_code == 200:
                 break
 
-            # Telegram rate limit
+            # Telegram 429
             if r.status_code == 429:
                 retry_after = 3
                 try:
@@ -106,15 +97,9 @@ def send_telegram_message(
                     retry_after = int(j.get("parameters", {}).get("retry_after", retry_after))
                 except Exception:
                     pass
-
-                if attempt >= max_retries:
-                    break
-
                 time.sleep(min(retry_after + 1, 60))
                 continue
 
-            # other errors: retry a few times, then stop for this chat_id
-            if attempt >= max_retries:
-                break
-
-            time.sleep(min(2 ** attempt, 20))
+            # Other HTTP errors: retry a bit, then give up (don’t crash bot)
+            backoff = min(2 ** attempt, 20) + random.uniform(0, 0.4)
+            time.sleep(backoff)

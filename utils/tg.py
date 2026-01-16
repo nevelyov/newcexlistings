@@ -6,21 +6,16 @@ from typing import List
 
 API = "https://api.telegram.org"
 
-# Ставь в workflow TG_MIN_INTERVAL="1.2" или "1.5" для почти нулевых 429.
-_MIN_INTERVAL_SECONDS = float(os.getenv("TG_MIN_INTERVAL", "1.2"))
+# HARD anti-429: ставится через env TG_MIN_INTERVAL
+_MIN_INTERVAL_SECONDS = float(os.getenv("TG_MIN_INTERVAL", "1.6"))
 
-# небольшая "дробилка" (jitter), чтобы 4 шарда не били одновременно
+# jitter чтобы 4 шарда не били одновременно
 _JITTER_SECONDS = float(os.getenv("TG_JITTER", "0.35"))
 
 _LAST_SEND_TS = 0.0
 
 
 def _parse_chat_ids() -> List[str]:
-    """
-    Поддержка:
-      - TG_CHAT_ID="123"
-      - TG_CHAT_IDS="-1001, -1002, 123"
-    """
     ids = []
     one = (os.getenv("TG_CHAT_ID") or "").strip()
     many = (os.getenv("TG_CHAT_IDS") or "").strip()
@@ -34,7 +29,6 @@ def _parse_chat_ids() -> List[str]:
             if p:
                 ids.append(p)
 
-    # unique preserve order
     out = []
     seen = set()
     for x in ids:
@@ -45,17 +39,11 @@ def _parse_chat_ids() -> List[str]:
 
 
 def _sleep_for_rate_limit():
-    """
-    Глобальный лимитер на процесс.
-    В GH Actions у каждого шарда свой процесс -> лимит применяется на шард.
-    Jitter уменьшает синхронные пики от 4 шардов.
-    """
     global _LAST_SEND_TS
     now = time.time()
 
     jitter = random.uniform(0.0, _JITTER_SECONDS) if _JITTER_SECONDS > 0 else 0.0
     earliest = _LAST_SEND_TS + _MIN_INTERVAL_SECONDS + jitter
-
     wait = earliest - now
     if wait > 0:
         time.sleep(wait)
@@ -69,13 +57,6 @@ def send_telegram_message(
     disable_web_page_preview: bool = True,
     max_retries: int = 8,
 ) -> None:
-    """
-    Best-effort sender:
-    - процессный rate limit + jitter
-    - retries with backoff
-    - respects Telegram 429 retry_after
-    - НЕ падает с исключениями
-    """
     token = (os.getenv("TG_BOT_TOKEN") or "").strip()
     if not token:
         return
@@ -104,8 +85,7 @@ def send_telegram_message(
             try:
                 r = requests.post(url, json=payload, timeout=25)
             except Exception:
-                # network/backoff
-                backoff = min(2 ** attempt, 30) + random.uniform(0.0, 0.5)
+                backoff = min(2 ** attempt, 30) + random.uniform(0.0, 0.6)
                 time.sleep(backoff)
                 continue
 
@@ -113,7 +93,6 @@ def send_telegram_message(
                 break
 
             if r.status_code == 429:
-                # Telegram tells exact seconds to wait
                 retry_after = 3
                 try:
                     j = r.json()
@@ -121,13 +100,11 @@ def send_telegram_message(
                 except Exception:
                     pass
 
-                # поднимем локальный "последний send", чтобы следующие отправки тоже сдвинулись
                 global _LAST_SEND_TS
                 _LAST_SEND_TS = time.time() + retry_after
 
                 time.sleep(min(retry_after + 1, 90))
                 continue
 
-            # другие HTTP ошибки: чуть подождать и повторить
-            backoff = min(2 ** attempt, 30) + random.uniform(0.0, 0.5)
+            backoff = min(2 ** attempt, 30) + random.uniform(0.0, 0.6)
             time.sleep(backoff)

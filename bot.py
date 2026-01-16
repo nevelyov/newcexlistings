@@ -1,197 +1,242 @@
-import os
+import ccxt
 import time
-import hashlib
-import requests
-import yaml
-from bs4 import BeautifulSoup
-from urllib.parse import urljoin
+import traceback
+from typing import Optional, Dict, Any, Tuple
+from datetime import datetime, timezone
 
-from ccxt_watcher import run_ccxt_scan
-from utils.state import load_seen, save_seen
+from utils.state2 import load_state, save_state
 from utils.tg import send_telegram_message
-from utils.parse import summarize
-from utils.coingecko import enrich
+from utils.parse import pick_best_contract, extract_contracts
+from utils.coingecko import enrich, search_coin
+from utils.dexscreener import (
+    search as dex_search,
+    extract_contract_from_pair,
+    extract_pair_url,
+)
+
+STATE_PATH = "data/seen_ccxt.json"
+DEFAULT_SKIP = {"USDT", "USDC", "BTC", "ETH", "BNB", "SOL"}
 
 
-HEADERS = {"User-Agent": "Mozilla/5.0 (cex-listing-bot)"}
+def _as_dict(x) -> dict:
+    return x if isinstance(x, dict) else {}
 
 
-def stable_id(exchange: str, url: str, title: str) -> str:
-    base = f"{exchange}|{url}|{title}".encode("utf-8")
-    return hashlib.sha256(base).hexdigest()[:24]
+def _guess_chain_from_contract(addr: Optional[str]) -> Optional[str]:
+    if not addr or not isinstance(addr, str):
+        return None
+    a = addr.strip()
+    if a.startswith("0x") and len(a) == 42:
+        return "EVM"
+    return None
 
 
-def fetch_html(url: str) -> str:
-    r = requests.get(url, timeout=30, headers=HEADERS)
-    r.raise_for_status()
-    return r.text
+def _safe_get_contract_from_currency(currency: dict) -> Optional[str]:
+    if not isinstance(currency, dict):
+        return None
+
+    info = _as_dict(currency.get("info"))
+    for k in ["contractAddress", "contract_address", "tokenAddress", "address", "contract"]:
+        v = info.get(k)
+        if isinstance(v, str) and v:
+            return v
+
+    networks = currency.get("networks") if isinstance(currency.get("networks"), dict) else {}
+    candidates = []
+    for _, obj in networks.items():
+        if isinstance(obj, dict):
+            inf = _as_dict(obj.get("info"))
+            for k in ["contractAddress", "contract_address", "tokenAddress", "address", "contract"]:
+                v = inf.get(k)
+                if isinstance(v, str) and v:
+                    candidates.append(v)
+
+    return pick_best_contract(candidates) if candidates else None
 
 
-def parse_listing_links(cfg: dict) -> list[dict]:
-    html = fetch_html(cfg["url"])
-    soup = BeautifulSoup(html, "lxml")
+def resolve_contract_and_refs(
+    ticker: str,
+    currency_obj: dict
+) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[str]]:
+    t = (ticker or "").upper().strip()
+    if not t:
+        return None, None, None, None
 
-    items = []
-    for a in soup.find_all("a", href=True):
-        href = a["href"]
-        text = a.get_text(" ", strip=True)
+    currency_obj = currency_obj if isinstance(currency_obj, dict) else {}
 
-        if cfg.get("link_contains") and (cfg["link_contains"] not in href):
-            continue
+    contract = _safe_get_contract_from_currency(currency_obj)
+    if contract:
+        return contract, None, None, _guess_chain_from_contract(contract)
 
-        if href.startswith("/"):
-            href = urljoin(cfg["url"], href)
+    raw = str(currency_obj.get("info") or "")
+    cands = extract_contracts(raw)
+    contract = pick_best_contract(cands)
+    if contract:
+        return contract, None, None, _guess_chain_from_contract(contract)
 
-        if not text:
-            continue
+    coingecko_id = None
 
-        low = text.lower()
-        kws = [k.lower() for k in cfg.get("keywords_any", [])]
-        if kws and not any(k in low for k in kws):
-            continue
-
-        items.append({"title": text, "url": href})
-
-    seen_urls = set()
-    out = []
-    for it in items:
-        if it["url"] in seen_urls:
-            continue
-        seen_urls.add(it["url"])
-        out.append(it)
-
-    return out[:40]
-
-
-def fetch_detail_text(url: str) -> str:
     try:
-        html = fetch_html(url)
+        hit = search_coin(t)
+        if hit and hit.get("id"):
+            coingecko_id = hit["id"]
+
+        cg = enrich(t)
+        plats = cg.get("platform_contracts") or {}
+        for chain_key, addr in plats.items():
+            if isinstance(addr, str) and addr:
+                chain_guess = str(chain_key).upper() if chain_key else None
+                return addr, coingecko_id, None, chain_guess
     except Exception:
-        return ""
-    soup = BeautifulSoup(html, "lxml")
-    return soup.get_text("\n", strip=True)[:20000]
+        pass
 
-
-def fmt_money(x):
-    if x is None:
-        return "n/a"
     try:
-        x = float(x)
+        pair = dex_search(t)
+        addr = extract_contract_from_pair(pair)
+        url = extract_pair_url(pair)
+
+        chain_guess = None
+        if isinstance(pair, dict):
+            ch = pair.get("chainId") or pair.get("chain_id")
+            if isinstance(ch, str) and ch:
+                chain_guess = ch.upper()
+
+        if addr or url:
+            return addr, coingecko_id, url, (chain_guess or _guess_chain_from_contract(addr))
     except Exception:
-        return "n/a"
-    if x >= 1e9:
-        return f"${x/1e9:.2f}B"
-    if x >= 1e6:
-        return f"${x/1e6:.2f}M"
-    if x >= 1e3:
-        return f"${x/1e3:.2f}K"
-    return f"${x:.2f}"
+        pass
+
+    return None, coingecko_id, None, None
 
 
-def _html_escape(s: str) -> str:
-    if s is None:
-        return ""
-    return (
-        str(s)
-        .replace("&", "&amp;")
-        .replace("<", "&lt;")
-        .replace(">", "&gt;")
-        .replace('"', "&quot;")
-    )
+def _mdv2_escape(s: str) -> str:
+    s = s or ""
+    for ch in r"_*[]()~`>#+-=|{}.!":
+        s = s.replace(ch, "\\" + ch)
+    return s
 
 
-def run_announcements_scan(max_messages: int = 8) -> None:
-    with open("config/exchanges.yaml", "r", encoding="utf-8") as f:
-        cfg = yaml.safe_load(f) or {}
+def build_message(
+    exchange_id: str,
+    ticker: str,
+    contract: Optional[str],
+    cg_id: Optional[str],
+    dex_url: Optional[str],
+    chain: Optional[str],
+    found_at: str
+) -> str:
+    ex_up = _mdv2_escape((exchange_id or "").upper())
+    t = _mdv2_escape((ticker or "").upper())
+    fa = _mdv2_escape(found_at or "")
 
-    exchanges = cfg.get("exchanges", []) or []
+    if contract:
+        c = f"`{_mdv2_escape(contract)}`"
+    else:
+        c = "n/a"
 
-    seen = load_seen()
-    new_seen = set(seen)
+    lines = [
+        "🆕 *NEW* \\(CCXT DETECTED\\)",
+        f"*Exchange:* {ex_up}",
+        f"*Ticker:* {t}",
+    ]
+    if chain:
+        lines.append(f"*Chain:* {_mdv2_escape(chain)}")
 
+    lines += [
+        f"*Contract:* {c}",
+        f"*Found:* {fa}",
+    ]
+
+    if cg_id:
+        lines.append(f"*CoinGecko ID:* {_mdv2_escape(cg_id)}")
+    if dex_url:
+        lines.append(f"*DexScreener:* {_mdv2_escape(dex_url)}")
+
+    return "\n".join(lines)
+
+
+def run_ccxt_scan(
+    shard_index: int = 0,
+    shard_total: int = 4,
+    max_exchanges_per_run: int = 35,
+    skip_common_on_first_run: bool = True,
+) -> None:
+    start = time.time()
+    MAX_SECONDS = 7 * 60
+    MAX_EXCHANGE_SECONDS = 35
+
+    MAX_MSG_PER_SHARD = int(os.getenv("CCXT_MAX_MSG_PER_SHARD", "4"))
     sent = 0
 
-    for ex in exchanges:
-        if sent >= max_messages:
-            break
-        if ex.get("type") != "html":
-            continue
+    state = load_state(STATE_PATH)
+    seen_map: Dict[str, str] = state["seen"]
 
-        ex_name = (ex.get("name") or "").strip()
-        if not ex_name:
-            continue
+    ids = ccxt.exchanges
+    shard_ids = [eid for i, eid in enumerate(ids) if (i % shard_total) == shard_index]
+    shard_ids = shard_ids[:max_exchanges_per_run]
+
+    first_run = (len(seen_map) == 0)
+
+    for eid in shard_ids:
+        if time.time() - start > MAX_SECONDS:
+            break
+        if sent >= MAX_MSG_PER_SHARD:
+            break
+
+        ex_start = time.time()
 
         try:
-            links = parse_listing_links(ex)
-        except Exception:
-            continue
+            ex_class = getattr(ccxt, eid)
+            ex = ex_class({"enableRateLimit": True, "timeout": 12000})
 
-        for it in links:
-            if sent >= max_messages:
-                break
+            try:
+                ex.load_markets()
+            except Exception:
+                pass
 
-            sid = stable_id(ex_name, it["url"], it["title"])
-            if sid in seen:
+            if time.time() - ex_start > MAX_EXCHANGE_SECONDS:
                 continue
 
-            detail_text = fetch_detail_text(it["url"])
-            ticker, contract = summarize(it["title"], detail_text)
+            currencies: Dict[str, Any] = getattr(ex, "currencies", None) or {}
+            if not isinstance(currencies, dict) or not currencies:
+                continue
 
-            mc = vol = None
-            cg_contract_hint = None
+            for code, ccy in currencies.items():
+                if time.time() - start > MAX_SECONDS:
+                    break
+                if time.time() - ex_start > MAX_EXCHANGE_SECONDS:
+                    break
+                if sent >= MAX_MSG_PER_SHARD:
+                    break
 
-            if ticker:
-                cg = enrich(ticker)
-                mc = cg.get("market_cap_usd")
-                vol = cg.get("volume_24h_usd")
-                plats = cg.get("platform_contracts") or {}
-                for chain, addr in plats.items():
-                    if addr:
-                        cg_contract_hint = f"{chain}:{addr}"
-                        break
+                ticker = (code or "").upper().strip()
+                if not ticker:
+                    continue
 
-            contract_final = contract
-            if not contract_final and cg_contract_hint and ":" in cg_contract_hint:
-                contract_final = cg_contract_hint.split(":", 1)[1]
+                if first_run and skip_common_on_first_run and ticker in DEFAULT_SKIP:
+                    continue
 
-            msg = []
-            msg.append("🆕 <b>NEW LISTING</b>")
-            msg.append(f"<b>Exchange:</b> {_html_escape(ex_name.upper())}")
-            msg.append(f"<b>Ticker:</b> {_html_escape((ticker or 'n/a').upper())}")
+                key = f"{(eid or '').upper()}:{ticker}"
+                if key in seen_map:
+                    continue
 
-            if contract_final:
-                msg.append(f"<b>Contract:</b> <code>{_html_escape(contract_final)}</code>")
-            else:
-                msg.append("<b>Contract:</b> n/a")
+                found_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+                seen_map[key] = found_at
 
-            msg.append(f"<b>24h Vol:</b> {_html_escape(fmt_money(vol))}")
-            msg.append(f"<b>MCap:</b> {_html_escape(fmt_money(mc))}")
-            msg.append(f"<b>Link:</b> {_html_escape(it['url'])}")
+                contract, cg_id, dex_url, chain = resolve_contract_and_refs(ticker, ccy)
 
-            send_telegram_message(
-                "\n".join(msg),
-                parse_mode="HTML",
-                disable_web_page_preview=True,
-            )
+                if not contract and not dex_url:
+                    continue
 
-            new_seen.add(sid)
-            sent += 1
+                send_telegram_message(
+                    build_message(eid, ticker, contract, cg_id, dex_url, chain, found_at),
+                    parse_mode="MarkdownV2",
+                    disable_web_page_preview=True,
+                )
+                sent += 1
 
-    if new_seen != seen:
-        save_seen(new_seen)
+        except Exception:
+            traceback.print_exc()
+            continue
 
-
-def main():
-    shard_index = int(os.getenv("SHARD_INDEX", "0"))
-    shard_total = int(os.getenv("SHARD_TOTAL", "4"))
-
-    # 1) CCXT scan
-    run_ccxt_scan(shard_index=shard_index, shard_total=shard_total)
-
-    # 2) HTML announcements scan (limited)
-    html_max = int(os.getenv("HTML_MAX_MSG", "6"))  # по умолчанию ещё ниже
-    run_announcements_scan(max_messages=html_max)
-
-
-if __name__ == "__main__":
-    main()
+    save_state(STATE_PATH, state)
